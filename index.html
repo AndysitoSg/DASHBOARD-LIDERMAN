@@ -797,10 +797,9 @@
     <script>
         
         
-        // --- INTEGRACIÓN GOOGLE SHEETS ULTRA-ROBUSTA (CON SOPORTE JSONP Y PUBLICAR EN LA WEB) ---
-        let autoSyncTimer = null;
-
+        // --- INTEGRACIÓN GOOGLE SHEETS ULTRA-ROBUSTA (CON SOPORTE NATIVO Y FALLBACK) ---
         const DEFAULT_USER_SHEETS_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTcyPXTFAoPGvRGVe0648wz2A6caeYUwLq7mogJnEokUAnyACY6Fy92L1dhqb0gbgQ_bmVlp1If6U8U/pub?gid=1202518638&single=true&output=csv';
+        let autoSyncTimer = null;
 
         function openSheetsModal() {
             const savedUrl = localStorage.getItem('liderman_sheets_url') || DEFAULT_USER_SHEETS_URL;
@@ -837,8 +836,84 @@
             await syncFromGoogleSheets(sheetId);
         }
 
-        // Función de fetch con timeout estricto para evitar que se quede girando
-        async function fetchWithTimeout(url, timeoutMs = 7000) {
+        function onSyncError(err) {
+            console.error("Error sincronizando Google Sheets:", err);
+            document.getElementById('loading').style.display = 'none';
+            const statusBadge = document.getElementById('migrationStatusBadge');
+            if (statusBadge) {
+                statusBadge.className = 'migration-status-badge status-error';
+                statusBadge.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> ERROR DE MIGRACIÓN`;
+                statusBadge.title = `Error: ${err.message || 'Fallo de conexión'}. Haz clic para ver solución.`;
+                statusBadge.onclick = () => alert(`⚠️ Error de migración:\n${err.message}\n\nVerifica que la hoja publicada esté accesible y contenga datos válidos.`);
+            }
+        }
+
+        function processRawGoogleData(rawData) {
+            const parsed = [];
+            rawData.forEach((row, index) => {
+                let cleanRow = {};
+                for (let k in row) cleanRow[k.trim().toUpperCase()] = row[k];
+
+                let zona = (cleanRow['ZONA'] || '').toString().trim().toUpperCase();
+                let nombre = (cleanRow['APELLIDOS Y NOMBRES'] || cleanRow['NOMBRE'] || '').toString().trim();
+                if (!nombre && !cleanRow['N° DOC']) return;
+
+                let avanceVal = cleanRow['AVANCE(%)'] || cleanRow['AVANCE'] || cleanRow['% AVANCE'] || '';
+                let avanceNum = 0.0;
+                let avanceStr = avanceVal.toString().trim();
+                if (typeof avanceVal === 'number') {
+                    avanceNum = avanceVal;
+                    avanceStr = `${Math.round(avanceVal)}%`;
+                } else if (avanceStr.toUpperCase() !== 'SIN REGISTRO') {
+                    let cleanNum = parseFloat(avanceStr.replace('%', ''));
+                    if (!isNaN(cleanNum)) avanceNum = cleanNum;
+                }
+
+                parsed.push({
+                    'ITEM': cleanRow['ITEM'] || (index + 1),
+                    'FECHA': cleanRow['FECHA'] ? cleanRow['FECHA'].toString().split('T')[0] : '',
+                    'ZONA': zona || 'ZONA NO DEFINIDA',
+                    'DISTRIBUCION': (cleanRow['DISTRIBUCION'] || '').toString().trim().toUpperCase(),
+                    'TP_DOC': (cleanRow['TP. DE DOC'] || cleanRow['T. DE DOCUMENTO'] || cleanRow['TIPO DOC'] || 'DNI').toString().trim().toUpperCase(),
+                    'NUM_DOC': (cleanRow['N° DOC'] || cleanRow['N° DOCUMENTO'] || cleanRow['NUMERO'] || '').toString().trim(),
+                    'NOMBRE': nombre,
+                    'ALTA': (cleanRow['ALTA'] || cleanRow['ESTADO ALTA'] || 'POR VER').toString().trim().toUpperCase(),
+                    'ASISTENCIA': (cleanRow['ASISTENCIA'] || 'POR REVISAR').toString().trim().toUpperCase(),
+                    'REPOSITORIO': (cleanRow['REPOSITORIO'] || 'SIN REGISTRO').toString().trim().toUpperCase(),
+                    'AVANCE_STR': avanceStr || '0%',
+                    'AVANCE_NUM': avanceNum,
+                    'RECLUTADOR': (cleanRow['RECLUTADOR'] || 'SIN ASIGNAR').toString().trim().toUpperCase(),
+                    'E_LEGAJO': (cleanRow['E.LEGAJO'] || cleanRow['LEGAJO'] || 'PENDIENTE').toString().trim().toUpperCase(),
+                    'OBS': (cleanRow['OBS'] || cleanRow['OBSERVACION'] || '-').toString().trim(),
+                    'REGULARIZACION': (cleanRow['REGULARIZACION'] || '').toString().trim(),
+                    'E_FINAL': (cleanRow['E.FINAL'] || cleanRow['ESTADO FINAL'] || 'NO APROBADO').toString().trim().toUpperCase()
+                });
+            });
+
+            if (parsed.length > 0) {
+                dbFull = parsed;
+                const now = new Date();
+                const horaStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                document.getElementById('lastUpdatedTag').innerHTML = `<i class="fa-solid fa-cloud-check" style="color:#10b981;"></i> NUBE ACTIVA: ${dbFull.length} REGISTROS (${horaStr})`;
+                
+                const statusBadge = document.getElementById('migrationStatusBadge');
+                if (statusBadge) {
+                    statusBadge.className = 'migration-status-badge status-success';
+                    statusBadge.innerHTML = `<i class="fa-solid fa-circle-check"></i> MIGRACIÓN EXITOSA (${horaStr})`;
+                    statusBadge.title = `Sincronización exitosa: ${dbFull.length} registros cargados a las ${horaStr}.`;
+                    statusBadge.onclick = null;
+                }
+
+                updateContextualFilters(currentTabId);
+                renderDashboard();
+            } else {
+                throw new Error("No se encontraron registros con nombres o DNI válidos en la hoja.");
+            }
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        // Helper para descargar texto CSV con timeout estricto de 5 segundos
+        async function fetchWithTimeout(url, timeoutMs = 5000) {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), timeoutMs);
             try {
@@ -851,16 +926,15 @@
             }
         }
 
-        // Helper para descargar texto CSV con reintentos y proxies anti-bloqueo CORS con timeout de 7s
         async function fetchCsvWithCorsFallbacks(targetUrl) {
             let cleanUrl = targetUrl;
             if (!cleanUrl.includes('output=csv')) {
                 cleanUrl += (cleanUrl.includes('?') ? '&' : '?') + 'output=csv';
             }
 
-            // Intento 1: Fetch directo con timeout
+            // Intento 1: Fetch directo con timeout de 5 segundos
             try {
-                const resp = await fetchWithTimeout(cleanUrl, 6000);
+                const resp = await fetchWithTimeout(cleanUrl, 5000);
                 if (resp.ok) {
                     const txt = await resp.text();
                     if (txt && txt.length > 20 && !txt.includes('<!DOCTYPE html>')) {
@@ -868,25 +942,25 @@
                     }
                 }
             } catch (e1) {
-                console.warn("Intento 1 directo no respondió a tiempo o bloqueado por CORS local, probando proxy...", e1);
+                console.warn("Intento 1 directo no respondió a tiempo o bloqueado por red, probando proxy...", e1);
             }
 
-            // Intento 2: Proxy CORS AllOrigins con timeout
+            // Intento 2: Proxy AllOrigins
             try {
                 const proxyUrl1 = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(cleanUrl);
-                const resp2 = await fetchWithTimeout(proxyUrl1, 6000);
+                const resp2 = await fetchWithTimeout(proxyUrl1, 5000);
                 if (resp2.ok) {
                     const txt2 = await resp2.text();
                     if (txt2 && txt2.length > 20) return txt2;
                 }
             } catch (e2) {
-                console.warn("Intento 2 proxy falló o bloqueado por firewall, probando alternativa...", e2);
+                console.warn("Intento 2 proxy falló, probando alternativa...", e2);
             }
 
-            // Intento 3: Proxy CORS corsproxy.io con timeout
+            // Intento 3: Proxy corsproxy.io
             try {
                 const proxyUrl2 = 'https://corsproxy.io/?' + encodeURIComponent(cleanUrl);
-                const resp3 = await fetchWithTimeout(proxyUrl2, 6000);
+                const resp3 = await fetchWithTimeout(proxyUrl2, 5000);
                 if (resp3.ok) {
                     const txt3 = await resp3.text();
                     if (txt3 && txt3.length > 20) return txt3;
@@ -895,7 +969,7 @@
                 console.warn("Intento 3 proxy falló:", e3);
             }
 
-            throw new Error("Tiempo de espera agotado. La red corporativa o el navegador bloquearon la conexión externa hacia la hoja.");
+            throw new Error("Tiempo de espera agotado al conectar con Google Sheets.");
         }
 
         async function syncFromGoogleSheets(targetParam) {
@@ -913,45 +987,21 @@
             document.getElementById('loading').style.display = 'inline';
             document.getElementById('loading').innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sincronizando con Google Sheets...';
 
-            // CASO A: Enlace publicado en la web (el enlace 2PACX proporcionado por el usuario)
-            if (targetParam.startsWith('http')) {
-                try {
-                    const csvText = await fetchCsvWithCorsFallbacks(targetParam);
-                    const workbook = XLSX.read(csvText, { type: 'string' });
-                    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-                    const rawData = XLSX.utils.sheet_to_json(firstSheet, { defval: "" });
-                    processRawGoogleData(rawData);
-                    return;
-                } catch (err) {
-                    onSyncError(err);
-                    return;
-                }
-            }
-
-            // CASO B: Enlace regular con ID de documento -> usar JSONP
             try {
-                const oldScript = document.getElementById('gviz-jsonp-script');
-                if (oldScript) oldScript.remove();
-
-                const sheetId = extractSheetId(targetParam);
-                const jsonpUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=responseHandler:handleGoogleData&sheet=LISTA%20GENERAL`;
-
-                const script = document.createElement('script');
-                script.id = 'gviz-jsonp-script';
-                script.src = jsonpUrl;
-                script.onerror = function() {
-                    onSyncError(new Error("Error al consultar Google Sheets. Asegúrate de que el documento esté en modo 'Cualquier persona con el enlace (Lector)'"));
-                };
-                document.body.appendChild(script);
-
+                // Descargar y procesar CSV
+                const csvText = await fetchCsvWithCorsFallbacks(targetParam);
+                const workbook = XLSX.read(csvText, { type: 'string' });
+                const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+                const rawData = XLSX.utils.sheet_to_json(firstSheet, { defval: "" });
+                processRawGoogleData(rawData);
             } catch (err) {
                 onSyncError(err);
+            } finally {
+                // ASEGURAR SIEMPRE QUE EL SPINNER SE APAGUE EN MENOS DE 3 SEGUNDOS
+                document.getElementById('loading').style.display = 'none';
             }
         }
 
-        
-
-        // Al iniciar, si hay un Sheet ID guardado, sincronizar automáticamente
         window.addEventListener('load', () => {
             const savedId = localStorage.getItem('liderman_sheets_id') || DEFAULT_USER_SHEETS_URL;
             if (savedId) {
